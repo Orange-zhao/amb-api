@@ -32,11 +32,13 @@ if DATABASE_URL:
         return conn
 
     def fetchall(cur):
-        return [dict(row) for row in cur.fetchall()]
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
 
     def fetchone(cur):
+        columns = [desc[0] for desc in cur.description]
         row = cur.fetchone()
-        return dict(row) if row else None
+        return dict(zip(columns, row)) if row else None
 
     PLACEHOLDER = "%s"
     print("Running in PostgreSQL mode")
@@ -52,11 +54,13 @@ else:
         return conn
 
     def fetchall(cur):
-        return [dict(row) for row in cur.fetchall()]
+        columns = [desc[0] for desc in cur.description]
+        return [dict(zip(columns, row)) for row in cur.fetchall()]
 
     def fetchone(cur):
+        columns = [desc[0] for desc in cur.description]
         row = cur.fetchone()
-        return dict(row) if row else None
+        return dict(zip(columns, row)) if row else None
 
     PLACEHOLDER = "?"
     print("Running in SQLite mode (local)")
