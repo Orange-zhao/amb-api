@@ -364,39 +364,85 @@ def get_related(key: str, limit: int = Query(10, description="Max related record
 # ── 6. Precompiled knowledge graph (reads from graph_edges table) ────────────
 
 @app.get("/graph")
-def get_graph():
+def get_graph(
+    min_weight: int = Query(
+        5,
+        description="Minimum edge weight"
+    ),
+    limit: int = Query(
+        3000,
+        description="Maximum number of returned edges"
+    )
+):
     """
-    Serves the precompiled knowledge graph. Edges are precomputed offline by
-    build_graph.py and stored in the `graph_edges` table (NOT a local file —
-    Railway containers don't keep local files across restarts). Nodes are
-    cheap to derive live from the `tags` table on every request.
+    Returns a filtered knowledge graph.
+
+    Edges are precomputed by build_graph.py and stored in graph_edges.
     """
+
     conn = get_db()
     cur = conn.cursor()
+    p = PLACEHOLDER
 
+    # ---------- Nodes ----------
     cur.execute("""
-        SELECT t.tag_id, t.tag_name, t.tag_type,
-               COUNT(rt.key) as record_count
+        SELECT
+            t.tag_id,
+            t.tag_name,
+            t.tag_type,
+            COUNT(rt.key) AS record_count
         FROM tags t
-        LEFT JOIN ref_tags rt ON t.tag_id = rt.tag_id
-        GROUP BY t.tag_id, t.tag_name, t.tag_type
+        LEFT JOIN ref_tags rt
+            ON t.tag_id = rt.tag_id
+        GROUP BY
+            t.tag_id,
+            t.tag_name,
+            t.tag_type
     """)
+
+    rows = fetchall(cur)
+
     nodes = [
-        {"id": f"tag_{r['tag_id']}", "label": r["tag_name"], "type": r["tag_type"], "count": r["record_count"]}
-        for r in cur.fetchall()
+        {
+            "id": f"tag_{r['tag_id']}",
+            "label": r["tag_name"],
+            "type": r.get("tag_type"),
+            "count": r["record_count"]
+        }
+        for r in rows
     ]
 
-    cur.execute("SELECT tag_id_a, tag_id_b, weight FROM graph_edges")
+    # ---------- Edges ----------
+    cur.execute(f"""
+        SELECT
+            tag_id_a,
+            tag_id_b,
+            weight
+        FROM graph_edges
+        WHERE weight >= {p}
+        ORDER BY weight DESC
+        LIMIT {p}
+    """, [min_weight, limit])
+
+    rows = fetchall(cur)
+
     edges = [
-        {"source": f"tag_{r['tag_id_a']}", "target": f"tag_{r['tag_id_b']}", "weight": r["weight"]}
-        for r in cur.fetchall()
+        {
+            "source": f"tag_{r['tag_id_a']}",
+            "target": f"tag_{r['tag_id_b']}",
+            "weight": r["weight"]
+        }
+        for r in rows
     ]
+
     conn.close()
 
-    if not edges:
-        return {"nodes": nodes, "edges": [], "note": "graph_edges is empty — run build_graph.py first"}
-
-    return {"nodes": nodes, "edges": edges}
+    return {
+        "nodes": nodes,
+        "edges": edges,
+        "edge_count": len(edges),
+        "min_weight": min_weight
+    }
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
