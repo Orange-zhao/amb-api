@@ -322,6 +322,82 @@ def get_stats():
     }
 
 
+
+
+@app.get("/related/{key}")
+def get_related(key: str, limit: int = Query(10, description="Max related records")):
+    """Finds records related to `key` by shared tags, ranked by overlap count."""
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("SELECT tag_id FROM ref_tags WHERE key = %s", [key])
+    tag_ids = [r["tag_id"] for r in cur.fetchall()]
+
+    if not tag_ids:
+        conn.close()
+        return {"key": key, "related": []}
+
+    cur.execute("""
+        SELECT r.key, r.title, r.author, r.pub_year,
+               COUNT(rt.tag_id) as shared_tags
+        FROM ref_tags rt
+        JOIN ref_records r ON rt.key = r.key
+        WHERE rt.tag_id = ANY(%s)
+          AND r.key != %s
+        GROUP BY r.key, r.title, r.author, r.pub_year
+        ORDER BY shared_tags DESC, r.pub_year DESC
+        LIMIT %s
+    """, [tag_ids, key, limit])
+    rows = cur.fetchall()
+    conn.close()
+
+    return {
+        "key": key,
+        "related": [
+            {"key": r["key"], "title": r["title"], "author": r["author"],
+             "year": r["pub_year"], "shared_tags": r["shared_tags"]}
+            for r in rows
+        ]
+    }
+
+
+# ── 6. Precompiled knowledge graph (reads from graph_edges table) ────────────
+
+@app.get("/graph")
+def get_graph():
+    """
+    Serves the precompiled knowledge graph. Edges are precomputed offline by
+    build_graph.py and stored in the `graph_edges` table (NOT a local file —
+    Railway containers don't keep local files across restarts). Nodes are
+    cheap to derive live from the `tags` table on every request.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT t.tag_id, t.tag_name, t.tag_type,
+               COUNT(rt.key) as record_count
+        FROM tags t
+        LEFT JOIN ref_tags rt ON t.tag_id = rt.tag_id
+        GROUP BY t.tag_id, t.tag_name, t.tag_type
+    """)
+    nodes = [
+        {"id": f"tag_{r['tag_id']}", "label": r["tag_name"], "type": r["tag_type"], "count": r["record_count"]}
+        for r in cur.fetchall()
+    ]
+
+    cur.execute("SELECT tag_id_a, tag_id_b, weight FROM graph_edges")
+    edges = [
+        {"source": f"tag_{r['tag_id_a']}", "target": f"tag_{r['tag_id_b']}", "weight": r["weight"]}
+        for r in cur.fetchall()
+    ]
+    conn.close()
+
+    if not edges:
+        return {"nodes": nodes, "edges": [], "note": "graph_edges is empty — run build_graph.py first"}
+
+    return {"nodes": nodes, "edges": edges}
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
