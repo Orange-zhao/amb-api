@@ -77,6 +77,17 @@ app.add_middleware(
 )
 
 
+# ── 0. Root / health check ────────────────────────────────────────────────────
+@app.get("/")
+def root():
+    return {
+        "status": "ok",
+        "service": "AMB Search API",
+        "mode": "postgres" if DATABASE_URL else "sqlite",
+        "docs": "/docs"
+    }
+
+
 # ── 1. Search ─────────────────────────────────────────────────────────────────
 @app.get("/search")
 def search(
@@ -329,26 +340,34 @@ def get_related(key: str, limit: int = Query(10, description="Max related record
     """Finds records related to `key` by shared tags, ranked by overlap count."""
     conn = get_db()
     cur = conn.cursor()
+    p = PLACEHOLDER
 
-    cur.execute("SELECT tag_id FROM ref_tags WHERE key = %s", [key])
-    tag_ids = [r["tag_id"] for r in cur.fetchall()]
+    cur.execute(f"SELECT tag_id FROM ref_tags WHERE key = {p}", [key])
+    tag_ids = [r["tag_id"] for r in fetchall(cur)]
 
     if not tag_ids:
         conn.close()
         return {"key": key, "related": []}
 
-    cur.execute("""
+    if DATABASE_URL:
+        tag_filter = f"rt.tag_id = ANY({p})"
+    else:
+        # SQLite has no ANY(); expand to an IN (...) list instead
+        tag_filter = f"rt.tag_id IN ({','.join([p] * len(tag_ids))})"
+        tag_ids = list(tag_ids)  # keep as separate params below
+
+    cur.execute(f"""
         SELECT r.key, r.title, r.author, r.pub_year,
                COUNT(rt.tag_id) as shared_tags
         FROM ref_tags rt
         JOIN ref_records r ON rt.key = r.key
-        WHERE rt.tag_id = ANY(%s)
-          AND r.key != %s
+        WHERE {tag_filter}
+          AND r.key != {p}
         GROUP BY r.key, r.title, r.author, r.pub_year
         ORDER BY shared_tags DESC, r.pub_year DESC
-        LIMIT %s
-    """, [tag_ids, key, limit])
-    rows = cur.fetchall()
+        LIMIT {p}
+    """, ([tag_ids] if DATABASE_URL else tag_ids) + [key, limit])
+    rows = fetchall(cur)
     conn.close()
 
     return {
