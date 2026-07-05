@@ -593,20 +593,32 @@ def search_graph_records(
     Cheap search over record titles only — used to populate a search box
     so the user can pick a starting PAPER (not a tag) for the literature
     relationship graph. Mirrors /graph/search but for records.
+
+    Splits the query into individual words and requires the title to
+    contain ALL of them (in any order/position), not the exact phrase —
+    so "Tibet medicine" also matches a title like "Traditional Medicine
+    in Tibet", not just titles containing that literal substring.
     """
     conn = get_db()
     cur = conn.cursor()
     p = PLACEHOLDER
 
-    like = f"%{q}%"
+    words = [w for w in q.strip().split() if w]
+    if not words:
+        conn.close()
+        return {"results": []}
+
     op = "ILIKE" if DATABASE_URL else "LIKE"
+    conditions = " AND ".join([f"title {op} {p}"] * len(words))
+    params = [f"%{w}%" for w in words]
+
     cur.execute(f"""
         SELECT key, title, author, pub_year
         FROM ref_records
-        WHERE title {op} {p}
+        WHERE {conditions}
         ORDER BY pub_year DESC NULLS LAST
         LIMIT {p}
-    """, [like, limit])
+    """, params + [limit])
     rows = fetchall(cur)
     conn.close()
 
