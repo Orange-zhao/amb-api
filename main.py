@@ -397,61 +397,50 @@ def get_graph(
     Returns a filtered knowledge graph.
 
     Edges are precomputed by build_graph.py and stored in graph_edges.
+    Only nodes that appear in at least one returned edge are included —
+    this avoids sending hundreds of disconnected/irrelevant nodes to the
+    front end just because they exist in the `tags` table.
     """
 
     conn = get_db()
     cur = conn.cursor()
     p = PLACEHOLDER
 
-    # ---------- Nodes ----------
-    cur.execute("""
-        SELECT
-            t.tag_id,
-            t.tag_name,
-            t.tag_type,
-            COUNT(rt.key) AS record_count
-        FROM tags t
-        LEFT JOIN ref_tags rt
-            ON t.tag_id = rt.tag_id
-        GROUP BY
-            t.tag_id,
-            t.tag_name,
-            t.tag_type
-    """)
-
-    rows = fetchall(cur)
-
-    nodes = [
-        {
-            "id": f"tag_{r['tag_id']}",
-            "label": r["tag_name"],
-            "type": r.get("tag_type"),
-            "count": r["record_count"]
-        }
-        for r in rows
-    ]
-
-    # ---------- Edges ----------
+    # ---------- Edges first (this determines which nodes we actually need) --
     cur.execute(f"""
-        SELECT
-            tag_id_a,
-            tag_id_b,
-            weight
+        SELECT tag_id_a, tag_id_b, weight
         FROM graph_edges
         WHERE weight >= {p}
         ORDER BY weight DESC
         LIMIT {p}
     """, [min_weight, limit])
+    edge_rows = fetchall(cur)
 
-    rows = fetchall(cur)
+    needed_ids = set()
+    for r in edge_rows:
+        needed_ids.add(r["tag_id_a"])
+        needed_ids.add(r["tag_id_b"])
+
+    nodes = []
+    if needed_ids:
+        id_list = ",".join(str(i) for i in needed_ids)
+        cur.execute(f"""
+            SELECT t.tag_id, t.tag_name, t.tag_type, COUNT(rt.key) AS record_count
+            FROM tags t
+            LEFT JOIN ref_tags rt ON t.tag_id = rt.tag_id
+            WHERE t.tag_id IN ({id_list})
+            GROUP BY t.tag_id, t.tag_name, t.tag_type
+        """)
+        rows = fetchall(cur)
+        nodes = [
+            {"id": f"tag_{r['tag_id']}", "label": r["tag_name"],
+             "type": r.get("tag_type"), "count": r["record_count"]}
+            for r in rows
+        ]
 
     edges = [
-        {
-            "source": f"tag_{r['tag_id_a']}",
-            "target": f"tag_{r['tag_id_b']}",
-            "weight": r["weight"]
-        }
-        for r in rows
+        {"source": f"tag_{r['tag_id_a']}", "target": f"tag_{r['tag_id_b']}", "weight": r["weight"]}
+        for r in edge_rows
     ]
 
     conn.close()
@@ -462,6 +451,137 @@ def get_graph(
         "edge_count": len(edges),
         "min_weight": min_weight
     }
+
+
+# ── 7. Lightweight node search (for a "pick a starting tag" search box) ──────
+@app.get("/graph/search")
+def search_graph_nodes(
+    q: str = Query(..., description="Search text to match against tag names"),
+    limit: int = Query(20, description="Max matching tags to return")
+):
+    """
+    Cheap, small-payload search over tag names only — used to populate a
+    search/autocomplete box so the user can pick a starting node, instead
+    of ever loading the full graph. Returns no edges.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    p = PLACEHOLDER
+
+    like = f"%{q}%"
+    if DATABASE_URL:
+        cur.execute(f"""
+            SELECT t.tag_id, t.tag_name, t.tag_type, COUNT(rt.key) AS record_count
+            FROM tags t
+            LEFT JOIN ref_tags rt ON t.tag_id = rt.tag_id
+            WHERE t.tag_name ILIKE {p}
+            GROUP BY t.tag_id, t.tag_name, t.tag_type
+            ORDER BY record_count DESC
+            LIMIT {p}
+        """, [like, limit])
+    else:
+        cur.execute(f"""
+            SELECT t.tag_id, t.tag_name, t.tag_type, COUNT(rt.key) AS record_count
+            FROM tags t
+            LEFT JOIN ref_tags rt ON t.tag_id = rt.tag_id
+            WHERE t.tag_name LIKE {p}
+            GROUP BY t.tag_id, t.tag_name, t.tag_type
+            ORDER BY record_count DESC
+            LIMIT {p}
+        """, [like, limit])
+
+    rows = fetchall(cur)
+    conn.close()
+
+    return {
+        "results": [
+            {"id": f"tag_{r['tag_id']}", "label": r["tag_name"],
+             "type": r.get("tag_type"), "count": r["record_count"]}
+            for r in rows
+        ]
+    }
+
+
+# ── 8. Ego-graph: one node + its direct neighbors only ───────────────────────
+@app.get("/graph/node/{tag_id}")
+def get_node_neighborhood(
+    tag_id: int,
+    min_weight: int = Query(1, description="Minimum edge weight to include"),
+    limit_neighbors: int = Query(15, description="Max neighboring nodes to return")
+):
+    """
+    Returns ONE node plus only its directly-connected neighbors (its
+    strongest co-occurring tags), not the whole graph. This is what the
+    front end should call:
+      1. right after the user picks a starting tag via /graph/search
+      2. again whenever the user clicks a node to "expand" it further
+
+    Each call stays small regardless of how big the overall graph is,
+    which is what avoids the white-screen crash from rendering thousands
+    of nodes/edges at once.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    p = PLACEHOLDER
+
+    cur.execute(f"""
+        SELECT tag_id, tag_name, tag_type FROM tags WHERE tag_id = {p}
+    """, [tag_id])
+    center = fetchone(cur)
+    if not center:
+        conn.close()
+        return {"error": "tag not found"}
+
+    cur.execute(f"""
+        SELECT tag_id_a, tag_id_b, weight
+        FROM graph_edges
+        WHERE (tag_id_a = {p} OR tag_id_b = {p})
+          AND weight >= {p}
+        ORDER BY weight DESC
+        LIMIT {p}
+    """, [tag_id, tag_id, min_weight, limit_neighbors])
+    edge_rows = fetchall(cur)
+
+    neighbor_ids = set()
+    for r in edge_rows:
+        other = r["tag_id_b"] if r["tag_id_a"] == tag_id else r["tag_id_a"]
+        neighbor_ids.add(other)
+
+    neighbor_nodes = []
+    if neighbor_ids:
+        id_list = ",".join(str(i) for i in neighbor_ids)
+        cur.execute(f"""
+            SELECT t.tag_id, t.tag_name, t.tag_type, COUNT(rt.key) AS record_count
+            FROM tags t
+            LEFT JOIN ref_tags rt ON t.tag_id = rt.tag_id
+            WHERE t.tag_id IN ({id_list})
+            GROUP BY t.tag_id, t.tag_name, t.tag_type
+        """)
+        rows = fetchall(cur)
+        neighbor_nodes = [
+            {"id": f"tag_{r['tag_id']}", "label": r["tag_name"],
+             "type": r.get("tag_type"), "count": r["record_count"]}
+            for r in rows
+        ]
+
+    # Center node's own record count
+    cur.execute(f"SELECT COUNT(*) FROM ref_tags WHERE tag_id = {p}", [tag_id])
+    center_count = cur.fetchone()[0]
+
+    conn.close()
+
+    nodes = [{
+        "id": f"tag_{center['tag_id']}", "label": center["tag_name"],
+        "type": center.get("tag_type"), "count": center_count
+    }] + neighbor_nodes
+
+    edges = [
+        {"source": f"tag_{r['tag_id_a']}", "target": f"tag_{r['tag_id_b']}", "weight": r["weight"]}
+        for r in edge_rows
+    ]
+
+    return {"nodes": nodes, "edges": edges, "center_id": f"tag_{tag_id}"}
+
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
