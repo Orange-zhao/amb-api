@@ -583,6 +583,108 @@ def get_node_neighborhood(
     return {"nodes": nodes, "edges": edges, "center_id": f"tag_{tag_id}"}
 
 
+# ── 9. Literature-level graph: search for a starting paper ───────────────────
+@app.get("/graph/record/search")
+def search_graph_records(
+    q: str = Query(..., description="Search text to match against titles"),
+    limit: int = Query(10, description="Max matching records to return")
+):
+    """
+    Cheap search over record titles only — used to populate a search box
+    so the user can pick a starting PAPER (not a tag) for the literature
+    relationship graph. Mirrors /graph/search but for records.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    p = PLACEHOLDER
+
+    like = f"%{q}%"
+    op = "ILIKE" if DATABASE_URL else "LIKE"
+    cur.execute(f"""
+        SELECT key, title, author, pub_year
+        FROM ref_records
+        WHERE title {op} {p}
+        ORDER BY pub_year DESC NULLS LAST
+        LIMIT {p}
+    """, [like, limit])
+    rows = fetchall(cur)
+    conn.close()
+
+    return {
+        "results": [
+            {"key": r["key"], "title": r["title"], "author": r["author"], "year": r["pub_year"]}
+            for r in rows
+        ]
+    }
+
+
+# ── 10. Literature-level ego-graph: one paper + its most similar papers ──────
+@app.get("/graph/record/{key}")
+def get_record_neighborhood(
+    key: str,
+    min_weight: int = Query(2, description="Minimum shared-tag count to include"),
+    limit_neighbors: int = Query(12, description="Max neighboring records to return")
+):
+    """
+    Returns ONE record plus only its most similar neighbors (by shared-tag
+    weight, precomputed by build_graph.py into record_edges) — the
+    literature equivalent of /graph/node/{tag_id}. Same click-to-expand
+    pattern: call this again with a neighbor's key to keep growing the
+    graph, instead of ever loading all record relationships at once.
+    """
+    conn = get_db()
+    cur = conn.cursor()
+    p = PLACEHOLDER
+
+    cur.execute(f"SELECT key, title, author, pub_year FROM ref_records WHERE key = {p}", [key])
+    center = fetchone(cur)
+    if not center:
+        conn.close()
+        return {"error": "record not found"}
+
+    cur.execute(f"""
+        SELECT key_a, key_b, weight
+        FROM record_edges
+        WHERE (key_a = {p} OR key_b = {p})
+          AND weight >= {p}
+        ORDER BY weight DESC
+        LIMIT {p}
+    """, [key, key, min_weight, limit_neighbors])
+    edge_rows = fetchall(cur)
+
+    neighbor_keys = set()
+    for r in edge_rows:
+        other = r["key_b"] if r["key_a"] == key else r["key_a"]
+        neighbor_keys.add(other)
+
+    neighbor_nodes = []
+    if neighbor_keys:
+        placeholders = ",".join([p] * len(neighbor_keys))
+        cur.execute(f"""
+            SELECT key, title, author, pub_year FROM ref_records
+            WHERE key IN ({placeholders})
+        """, list(neighbor_keys))
+        rows = fetchall(cur)
+        neighbor_nodes = [
+            {"id": r["key"], "label": r["title"], "author": r["author"], "year": r["pub_year"]}
+            for r in rows
+        ]
+
+    conn.close()
+
+    nodes = [{
+        "id": center["key"], "label": center["title"],
+        "author": center["author"], "year": center["pub_year"]
+    }] + neighbor_nodes
+
+    edges = [
+        {"source": r["key_a"], "target": r["key_b"], "weight": r["weight"]}
+        for r in edge_rows
+    ]
+
+    return {"nodes": nodes, "edges": edges, "center_id": key}
+
+
 # ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
