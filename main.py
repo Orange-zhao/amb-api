@@ -337,47 +337,55 @@ def get_stats():
 
 @app.get("/related/{key}")
 def get_related(key: str, limit: int = Query(10, description="Max related records")):
-    """Finds records related to `key` by shared tags, ranked by overlap count."""
+    """
+    Finds records related to `key`, ranked by a precomputed similarity
+    score (IDF + tag-hierarchy-level weighted cosine similarity — see
+    build_graph.py). This reads from record_edges rather than counting
+    raw shared tags live, so broad/generic tags no longer dominate the
+    ranking the way a simple COUNT(shared tags) would.
+
+    Note: results reflect the last time build_graph.py was run, not the
+    live database — rerun that script after new records/tags are added.
+    """
     conn = get_db()
     cur = conn.cursor()
     p = PLACEHOLDER
 
-    cur.execute(f"SELECT tag_id FROM ref_tags WHERE key = {p}", [key])
-    tag_ids = [r["tag_id"] for r in fetchall(cur)]
+    cur.execute(f"""
+        SELECT key_a, key_b, weight FROM record_edges
+        WHERE key_a = {p} OR key_b = {p}
+        ORDER BY weight DESC
+        LIMIT {p}
+    """, [key, key, limit])
+    edge_rows = fetchall(cur)
 
-    if not tag_ids:
+    if not edge_rows:
         conn.close()
         return {"key": key, "related": []}
 
-    if DATABASE_URL:
-        tag_filter = f"rt.tag_id = ANY({p})"
-    else:
-        # SQLite has no ANY(); expand to an IN (...) list instead
-        tag_filter = f"rt.tag_id IN ({','.join([p] * len(tag_ids))})"
-        tag_ids = list(tag_ids)  # keep as separate params below
+    neighbor_keys = [r["key_b"] if r["key_a"] == key else r["key_a"] for r in edge_rows]
+    weight_by_key = {
+        (r["key_b"] if r["key_a"] == key else r["key_a"]): r["weight"] for r in edge_rows
+    }
 
+    placeholders = ",".join([p] * len(neighbor_keys))
     cur.execute(f"""
-        SELECT r.key, r.title, r.author, r.pub_year,
-               COUNT(rt.tag_id) as shared_tags
-        FROM ref_tags rt
-        JOIN ref_records r ON rt.key = r.key
-        WHERE {tag_filter}
-          AND r.key != {p}
-        GROUP BY r.key, r.title, r.author, r.pub_year
-        ORDER BY shared_tags DESC, r.pub_year DESC
-        LIMIT {p}
-    """, ([tag_ids] if DATABASE_URL else tag_ids) + [key, limit])
+        SELECT key, title, author, pub_year FROM ref_records
+        WHERE key IN ({placeholders})
+    """, neighbor_keys)
     rows = fetchall(cur)
     conn.close()
 
-    return {
-        "key": key,
-        "related": [
-            {"key": r["key"], "title": r["title"], "author": r["author"],
-             "year": r["pub_year"], "shared_tags": r["shared_tags"]}
-            for r in rows
-        ]
-    }
+    related = [
+        {
+            "key": r["key"], "title": r["title"], "author": r["author"],
+            "year": r["pub_year"], "similarity": round(weight_by_key[r["key"]], 4)
+        }
+        for r in rows
+    ]
+    related.sort(key=lambda r: r["similarity"], reverse=True)
+
+    return {"key": key, "related": related}
 
 
 # ── 6. Precompiled knowledge graph (reads from graph_edges table) ────────────
