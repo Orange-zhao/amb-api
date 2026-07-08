@@ -346,6 +346,13 @@ def get_related(key: str, limit: int = Query(10, description="Max related record
 
     Note: results reflect the last time build_graph.py was run, not the
     live database — rerun that script after new records/tags are added.
+
+    NOTE: `similarity` here is a 0-1 cosine similarity, NOT a percentage.
+    If the front end displays it as a "% match", it must multiply by 100
+    itself (and should NOT normalize against the max value in the current
+    result set — that's what produces the "everything shows 100%" bug,
+    since the top-ranked result in ANY list would then always show 100%
+    regardless of its real similarity).
     """
     conn = get_db()
     cur = conn.cursor()
@@ -408,6 +415,11 @@ def get_graph(
     Only nodes that appear in at least one returned edge are included —
     this avoids sending hundreds of disconnected/irrelevant nodes to the
     front end just because they exist in the `tags` table.
+
+    NOTE: graph_edges.weight (the TAG-to-tag graph) is a raw integer
+    co-occurrence COUNT, unlike record_edges.weight (the RECORD-to-record
+    graph) which is a 0-1 cosine similarity. Don't copy min_weight
+    defaults between the two — they're on completely different scales.
     """
 
     conn = get_db()
@@ -642,15 +654,23 @@ def search_graph_records(
 @app.get("/graph/record/{key}")
 def get_record_neighborhood(
     key: str,
-    min_weight: int = Query(2, description="Minimum shared-tag count to include"),
+    min_weight: float = Query(0.05, description="Minimum cosine similarity (0-1) to include"),
     limit_neighbors: int = Query(12, description="Max neighboring records to return")
 ):
     """
-    Returns ONE record plus only its most similar neighbors (by shared-tag
-    weight, precomputed by build_graph.py into record_edges) — the
-    literature equivalent of /graph/node/{tag_id}. Same click-to-expand
+    Returns ONE record plus only its most similar neighbors (by IDF +
+    tag-hierarchy-level weighted cosine similarity, precomputed by
+    build_graph.py into record_edges — see MIN_RECORD_SIMILARITY there) —
+    the literature equivalent of /graph/node/{tag_id}. Same click-to-expand
     pattern: call this again with a neighbor's key to keep growing the
     graph, instead of ever loading all record relationships at once.
+
+    NOTE: record_edges.weight is a 0-1 cosine similarity, NOT a raw
+    shared-tag count (that was an older scheme). min_weight must stay on
+    the same 0-1 scale — passing an integer like 2 here silently returns
+    zero edges every time, since similarity never reaches 2. (This was
+    the bug: the old default of 2 made every call to this endpoint
+    return a center node with no neighbors at all.)
     """
     conn = get_db()
     cur = conn.cursor()
